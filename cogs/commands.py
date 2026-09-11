@@ -411,6 +411,75 @@ class CommandsCog(commands.Cog):
         else:
             await interaction.response.send_message("ℹ️ No saved profile was found.", ephemeral=True)
 
+    # --- /limit group (per-user daily token budgets) ---
+    limit_group = app_commands.Group(name="limit", description="Manage per-user daily token limits")
+
+    @staticmethod
+    def _is_limit_admin(interaction: discord.Interaction) -> bool:
+        """Server managers/admins only (unavailable in DMs)."""
+        perms = getattr(interaction.user, "guild_permissions", None)
+        if perms is None:
+            return False
+        return bool(getattr(perms, "manage_guild", False) or getattr(perms, "administrator", False))
+
+    @limit_group.command(name="set", description="Set a user's daily token cap (0 = unlimited)")
+    @app_commands.describe(user="Member to limit", tokens="Max total tokens per UTC day (0 = unlimited)")
+    async def limit_set(self, interaction: discord.Interaction, user: discord.Member, tokens: int) -> None:
+        if not self._is_limit_admin(interaction):
+            await interaction.response.send_message(
+                "❌ Only server managers/admins can set token limits.", ephemeral=True
+            )
+            return
+        if tokens < 0:
+            await interaction.response.send_message("❌ Token cap must be 0 or higher.", ephemeral=True)
+            return
+        await self.config.set_user_token_limit(user.id, tokens)
+        label = "unlimited" if tokens == 0 else f"`{tokens:,}` tokens/day"
+        await interaction.response.send_message(
+            f"✅ Daily token cap for **{user.display_name}** set to {label}.", ephemeral=True
+        )
+
+    @limit_group.command(name="view", description="View token limit + today's usage (self or, for admins, others)")
+    @app_commands.describe(user="Member to inspect (default: yourself)")
+    async def limit_view(
+        self, interaction: discord.Interaction, user: Optional[discord.Member] = None
+    ) -> None:
+        target = user or interaction.user
+        if target.id != interaction.user.id and not self._is_limit_admin(interaction):
+            await interaction.response.send_message(
+                "❌ Only server managers/admins can view other users' usage.", ephemeral=True
+            )
+            return
+        limit = await self.config.get_user_token_limit(target.id)
+        usage = await self.config.get_token_usage(target.id)
+        limit_label = "unlimited" if limit <= 0 else f"`{limit:,}`"
+        name = "You have" if target.id == interaction.user.id else f"**{target.display_name}** has"
+        await interaction.response.send_message(
+            f"📊 {name} used `{usage['total_tokens']:,}` / {limit_label} tokens today "
+            f"(`{usage['prompt_tokens']:,}` in / `{usage['completion_tokens']:,}` out). "
+            f"Resets at UTC midnight.",
+            ephemeral=True,
+        )
+
+    @limit_group.command(name="clear", description="Remove a user's custom cap (falls back to server default)")
+    @app_commands.describe(user="Member whose override to remove")
+    async def limit_clear(self, interaction: discord.Interaction, user: discord.Member) -> None:
+        if not self._is_limit_admin(interaction):
+            await interaction.response.send_message(
+                "❌ Only server managers/admins can clear token limits.", ephemeral=True
+            )
+            return
+        deleted = await self.config.clear_user_token_limit(user.id)
+        if deleted:
+            await interaction.response.send_message(
+                f"🗑️ Custom token cap removed for **{user.display_name}** (back to server default).",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"ℹ️ **{user.display_name}** has no custom cap set.", ephemeral=True
+            )
+
     # --- /clear & /config top-level commands ---
 
     @app_commands.command(name="clear", description="Clear conversation memory for this channel/thread")

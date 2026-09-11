@@ -30,6 +30,20 @@ DEFAULT_SYSTEM_PROMPT = os.getenv(
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.7"))
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "20"))
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
+# Default per-user daily token cap (total tokens). 0 = unlimited unless overridden per user.
+try:
+    DEFAULT_DAILY_TOKEN_LIMIT = int(os.getenv("DEFAULT_DAILY_TOKEN_LIMIT", "0"))
+except ValueError:
+    DEFAULT_DAILY_TOKEN_LIMIT = 0
+if DEFAULT_DAILY_TOKEN_LIMIT < 0:
+    DEFAULT_DAILY_TOKEN_LIMIT = 0
+
+
+def _utc_today() -> str:
+    """Current UTC day as YYYY-MM-DD (token limits reset at UTC midnight)."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 @dataclass
@@ -88,6 +102,21 @@ class ConfigManager:
                     bio TEXT
                 )
             """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS user_token_limits (
+                    user_id INTEGER PRIMARY KEY,
+                    daily_limit INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS user_token_usage (
+                    user_id INTEGER NOT NULL,
+                    day TEXT NOT NULL,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (user_id, day)
+                )
+            """)
             await db.commit()
         logger.info(f"Initialized database schema at {self.db_path}")
 
@@ -124,6 +153,101 @@ class ConfigManager:
             res = await db.execute("DELETE FROM user_profiles WHERE user_id = ?", (user_id,))
             await db.commit()
             return res.rowcount > 0
+
+    # --- Per-User Daily Token Limits ---
+
+    async def set_user_token_limit(self, user_id: int, daily_limit: int) -> None:
+        """Set a per-user daily token cap. 0 (or negative) means unlimited."""
+        limit = max(0, int(daily_limit))
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO user_token_limits (user_id, daily_limit)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET daily_limit=excluded.daily_limit
+                """,
+                (user_id, limit),
+            )
+            await db.commit()
+
+    async def clear_user_token_limit(self, user_id: int) -> bool:
+        """Remove a per-user override (falls back to DEFAULT_DAILY_TOKEN_LIMIT)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            res = await db.execute("DELETE FROM user_token_limits WHERE user_id = ?", (user_id,))
+            await db.commit()
+            return res.rowcount > 0
+
+    async def get_user_token_limit(self, user_id: int) -> int:
+        """Effective daily token cap for a user. 0 = unlimited."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT daily_limit FROM user_token_limits WHERE user_id = ?",
+                (user_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row and row[0] is not None:
+                    return max(0, int(row[0]))
+        return DEFAULT_DAILY_TOKEN_LIMIT
+
+    async def add_token_usage(
+        self,
+        user_id: int,
+        prompt_tokens: int,
+        completion_tokens: int,
+        day: Optional[str] = None,
+    ) -> None:
+        """Accumulate token usage for a user on a UTC day."""
+        day = day or _utc_today()
+        prompt_tokens = max(0, int(prompt_tokens or 0))
+        completion_tokens = max(0, int(completion_tokens or 0))
+        if prompt_tokens == 0 and completion_tokens == 0:
+            return
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO user_token_usage (user_id, day, prompt_tokens, completion_tokens)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, day) DO UPDATE SET
+                    prompt_tokens=user_token_usage.prompt_tokens+excluded.prompt_tokens,
+                    completion_tokens=user_token_usage.completion_tokens+excluded.completion_tokens
+                """,
+                (user_id, day, prompt_tokens, completion_tokens),
+            )
+            await db.commit()
+
+    async def get_token_usage(
+        self, user_id: int, day: Optional[str] = None
+    ) -> Dict[str, int]:
+        """Token usage for a user on a UTC day (defaults to today)."""
+        day = day or _utc_today()
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT prompt_tokens, completion_tokens FROM user_token_usage "
+                "WHERE user_id = ? AND day = ?",
+                (user_id, day),
+            ) as cursor:
+                row = await cursor.fetchone()
+                prompt = int(row[0]) if row else 0
+                completion = int(row[1]) if row else 0
+        return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+
+    async def check_daily_limit(self, user_id: int) -> Optional[str]:
+        """
+        Return a user-facing refusal message if the user exhausted today's
+        token budget, else None. 0 limit = unlimited.
+        """
+        limit = await self.get_user_token_limit(user_id)
+        if limit <= 0:
+            return None
+        usage = await self.get_token_usage(user_id)
+        used = usage["total_tokens"]
+        if used >= limit:
+            return (
+                f"⚠️ **Daily token limit reached** — you've used "
+                f"`{used:,}` / `{limit:,}` tokens today. "
+                f"Limits reset at UTC midnight. Ask a server admin to raise your cap."
+            )
+        return None
 
     # --- Channel Configs ---
 

@@ -28,6 +28,32 @@ class LLMEngine:
         self.config_manager = config_manager
         self.skill_manager = skill_manager
 
+    @staticmethod
+    def _usage_numbers(usage: Any) -> tuple[int, int]:
+        """Extract (prompt_tokens, completion_tokens) from LiteLLM usage (object or dict)."""
+        if usage is None:
+            return (0, 0)
+        if isinstance(usage, dict):
+            prompt = usage.get("prompt_tokens", 0) or 0
+            completion = usage.get("completion_tokens", 0) or 0
+        else:
+            prompt = getattr(usage, "prompt_tokens", 0) or 0
+            completion = getattr(usage, "completion_tokens", 0) or 0
+        try:
+            return (max(0, int(prompt)), max(0, int(completion)))
+        except (TypeError, ValueError):
+            return (0, 0)
+
+    async def _record_usage(self, user_id: Optional[int], response: Any) -> None:
+        """Persist token usage from a LiteLLM response (best-effort, never raises)."""
+        if user_id is None:
+            return
+        try:
+            prompt, completion = self._usage_numbers(getattr(response, "usage", None))
+            await self.config_manager.add_token_usage(user_id, prompt, completion)
+        except Exception as e:
+            logger.debug(f"Could not record token usage: {e}")
+
     async def generate_response(
         self,
         session: ConversationSession,
@@ -68,10 +94,22 @@ class LLMEngine:
         tools = self.skill_manager.get_openai_tools(channel_id=target_id)
         tools_param = tools if tools else None
 
+        # Per-user daily token budget: refuse up front if already exhausted.
+        if user_id is not None:
+            refusal = await self.config_manager.check_daily_limit(user_id)
+            if refusal:
+                return refusal
+
         iteration = 0
         while iteration < max_tool_iterations:
             iteration += 1
             messages = session.get_messages()
+
+            # Stop mid-turn if the budget ran out during tool iterations.
+            if user_id is not None and iteration > 1:
+                mid_refusal = await self.config_manager.check_daily_limit(user_id)
+                if mid_refusal:
+                    return mid_refusal + "\n\n_(Stopped mid-response: budget exhausted during tool use.)_"
 
             completion_kwargs: Dict[str, Any] = {
                 "model": model,
@@ -92,6 +130,7 @@ class LLMEngine:
 
             try:
                 response = await acompletion(**completion_kwargs)
+                await self._record_usage(user_id, response)
             except Exception as e:
                 logger.error(f"LiteLLM completion error for model {model}: {e}", exc_info=True)
                 err_str = str(e)

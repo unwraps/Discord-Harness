@@ -393,6 +393,25 @@ class ChatCog(commands.Cog):
         # Split and send response in Discord-safe chunks
         chunks = split_message(response_text, limit=1950) if response_text else []
 
+        # Auto-speak the reply in VC if enabled (fire-and-forget, never blocks text)
+        try:
+            voice_cog = self.bot.get_cog("VoiceCog")
+            if voice_cog is not None and message.guild is not None and response_text:
+                import asyncio as _asyncio
+
+                author_voice = getattr(message.author, "voice", None)
+                _asyncio.create_task(
+                    voice_cog.speak_response(
+                        message.guild,
+                        target_channel.id,
+                        response_text,
+                        parent_id=getattr(target_channel, "parent_id", None),
+                        voice_channel=author_voice.channel if author_voice else None,
+                    )
+                )
+        except Exception:
+            pass
+
         if not chunks:
             # If the response only had media/view and no extra text, send directly!
             kwargs = {}

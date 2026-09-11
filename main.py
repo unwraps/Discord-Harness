@@ -21,6 +21,7 @@ from harness.models import ModelCatalog
 from skills.manager import SkillManager
 from cogs.chat import setup_chat
 from cogs.commands import setup_commands
+from cogs.voice import setup_voice
 
 # Setup logging
 logging.basicConfig(
@@ -37,9 +38,42 @@ def create_bot() -> commands.Bot:
     intents.message_content = True
     intents.guilds = True
     intents.messages = True
+    intents.voice_states = True
 
     bot = commands.Bot(command_prefix="!", intents=intents)
     return bot
+
+
+def ensure_opus() -> None:
+    """
+    Explicitly load the Opus codec discord.py ships under discord/bin/.
+
+    discord.py does NOT auto-load its bundled copy and Windows'
+    find_library('opus') won't discover it — without this, every
+    VoiceClient.play() raises OpusNotLoaded and no audio is ever sent.
+    """
+    try:
+        from discord import opus
+    except Exception as e:
+        logger.warning(f"Could not import discord.opus, voice audio will fail: {e}")
+        return
+    if opus.is_loaded():
+        return
+    bin_dir = Path(discord.__file__).parent / "bin"
+    arch = "x64" if __import__("struct").calcsize("P") * 8 == 64 else "x86"
+    candidates = [bin_dir / f"libopus-0.{arch}.dll", bin_dir / "libopus-0.dll"]
+    for dll in candidates:
+        if dll.exists():
+            try:
+                opus.load_opus(str(dll))
+                logger.info(f"Loaded Opus codec from bundled {dll.name}.")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load bundled Opus {dll}: {e}")
+    logger.warning(
+        "No usable Opus library found — voice playback will fail with "
+        "OpusNotLoaded. Install Opus or restore discord/bin/*.dll."
+    )
 
 
 async def main() -> None:
@@ -67,6 +101,7 @@ async def main() -> None:
 
     llm_engine = LLMEngine(config_manager=config_manager, skill_manager=skill_manager)
 
+    ensure_opus()
     bot = create_bot()
 
     @bot.event
@@ -88,6 +123,7 @@ async def main() -> None:
     # Load Cogs
     await setup_chat(bot, llm_engine, memory_manager, config_manager, skill_manager)
     await setup_commands(bot, config_manager, memory_manager, skill_manager, model_catalog)
+    await setup_voice(bot)
 
     # Start Bot
     logger.info("Starting Discord LLM Harness Bot...")
