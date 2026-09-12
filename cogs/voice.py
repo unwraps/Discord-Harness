@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 class _GuildVoiceState:
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     player_task: Optional[asyncio.Task] = None
-    auto_channels: set = field(default_factory=set)
+    auto_disabled_channels: set = field(default_factory=set)
     voice: Optional[str] = None
 
 
@@ -58,11 +58,11 @@ class VoiceCog(commands.Cog, name="VoiceCog"):
         return self._states[guild_id]
 
     def is_auto(self, guild_id: int, channel_id: int, parent_id: Optional[int] = None) -> bool:
-        auto = self._state(guild_id).auto_channels
-        if channel_id in auto:
-            return True
-        # Threads: auto enabled on the parent text channel also covers its threads.
-        return parent_id is not None and parent_id in auto
+        disabled = self._state(guild_id).auto_disabled_channels
+        if channel_id in disabled:
+            return False
+        # Disabling auto-speak on a parent also disables it for its threads.
+        return parent_id is None or parent_id not in disabled
 
     async def _reply(self, interaction: discord.Interaction, msg: str) -> None:
         """Reply via followup if already deferred/responded, else direct response."""
@@ -252,7 +252,7 @@ class VoiceCog(commands.Cog, name="VoiceCog"):
         parent_id: Optional[int] = None,
         voice_channel: Optional[discord.VoiceChannel] = None,
     ) -> None:
-        """Speak an LLM reply aloud if auto-speak is on and bot is in VC."""
+        """Speak an LLM reply aloud if auto-speak is enabled and bot is in VC."""
         if guild is None or not text or not text.strip():
             return
         if not self.is_auto(guild.id, channel_id, parent_id):
@@ -384,13 +384,13 @@ class VoiceCog(commands.Cog, name="VoiceCog"):
             return
         state = self._state(interaction.guild.id)
         if mode.value == "on":
-            state.auto_channels.add(interaction.channel_id)
+            state.auto_disabled_channels.discard(interaction.channel_id)
             await interaction.response.send_message(
-                "🔊 **Auto-speak ON** for this channel. Join VC with `/voice join` and my replies will be read aloud.",
+                "🔊 **Auto-speak ON** for this channel. My replies will be read aloud when I'm in VC.",
                 ephemeral=True,
             )
         else:
-            state.auto_channels.discard(interaction.channel_id)
+            state.auto_disabled_channels.add(interaction.channel_id)
             await interaction.response.send_message("🔇 **Auto-speak OFF** for this channel.", ephemeral=True)
 
     @voice_group.command(name="voice", description="View or change the TTS voice for this server")

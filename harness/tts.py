@@ -16,7 +16,7 @@ from typing import List
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_VOICE = os.getenv("TTS_VOICE", "en-US-AriaNeural")
+DEFAULT_VOICE = os.getenv("TTS_VOICE", "en-IN-NeerjaNeural")
 
 # Curated voice choices surfaced in the /voice voice autocomplete.
 CURATED_VOICES = [
